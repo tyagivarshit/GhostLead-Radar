@@ -26,11 +26,18 @@ Setup Steps:
    (Reddit API credentials are NOT needed in RSS mode.)
 
 4. Run the radar:
+   # Continuous daemon loop:
    python radar.py
+   # Single execution (e.g. GitHub Actions cron):
+   python radar.py --once
+   # Or via environment variable:
+   RUN_ONCE=true python radar.py
 """
 
+import argparse
 import html
 import logging
+import os
 import re
 import signal
 import sqlite3
@@ -506,8 +513,61 @@ def process(post: Post, seen_store: Optional[SeenStore] = None) -> None:
     sleep_interruptible(1.0)
 
 
-def run_radar() -> None:
-    """Main listening and polling loop."""
+def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parses command-line arguments for GhostLead Radar."""
+    parser = argparse.ArgumentParser(
+        description="GhostLead Radar - Real-Time Reddit Social Listening / Intent Radar"
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single polling cycle and exit cleanly without entering the continuous loop",
+    )
+    return parser.parse_args(argv)
+
+
+def is_single_run_mode(args: Optional[argparse.Namespace] = None) -> bool:
+    """
+    Checks if single-run mode is active via --once CLI flag or RUN_ONCE environment variable.
+    """
+    env_run_once = os.getenv("RUN_ONCE", "").strip().lower() in ("true", "1", "yes")
+    cli_once = bool(args and args.once)
+    return cli_once or env_run_once
+
+
+def poll_cycle(seen_store: SeenStore) -> None:
+    """
+    Executes a single polling iteration:
+    1. Fetches latest posts from Reddit Atom RSS feed.
+    2. Silently marks seen if initial run with empty DB and backlog alert disabled.
+    3. Checks deduplication, matches keywords, sends Telegram alerts, and saves seen posts.
+    """
+    logger.info("Polling Reddit RSS feed...")
+    posts = fetch_new_posts()
+
+    # Process posts oldest-first so alerts arrive in chronological order
+    posts_to_process = list(reversed(posts))
+
+    # Check if this is the initial run with an empty database
+    if seen_store.is_empty() and not config.ALERT_ON_FIRST_RUN_BACKLOG:
+        logger.info(
+            "First run with empty database: silently marking %d existing posts as seen without alerts.",
+            len(posts_to_process),
+        )
+        for post in posts_to_process:
+            seen_store.add(post.id)
+    else:
+        for post in posts_to_process:
+            if not running:
+                break
+            process(post, seen_store)
+
+
+def run_radar(once: Optional[bool] = None) -> None:
+    """Main listening and polling loop or single-pass execution."""
+    if once is None:
+        once = is_single_run_mode()
+
     seen_store = SeenStore(config.DB_PATH)
 
     logger.info("Starting GhostLead Radar (RSS Mode)...")
@@ -515,6 +575,23 @@ def run_radar() -> None:
     logger.info("Feed URL: %s", FEED_URL)
     logger.info("Subreddits: %s", ", ".join(config.SUBREDDITS))
     logger.info("Keywords configured: %d", len(config.KEYWORDS))
+
+    if once:
+        logger.info("Single-run execution mode active (--once / RUN_ONCE).")
+        try:
+            poll_cycle(seen_store)
+            logger.info("Single-run execution finished successfully.")
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            logger.warning("Reddit HTTP error %s during single-run: %s", status_code, exc)
+        except ET.ParseError as exc:
+            logger.warning("XML parse error during single-run: %s", exc)
+        except requests.RequestException as exc:
+            logger.warning("Reddit request network error during single-run: %s", exc)
+        except Exception:
+            logger.exception("Unexpected error during single-run poll.")
+        return
+
     logger.info(
         "Polling interval: %d seconds. Fetch limit: %d",
         config.POLL_INTERVAL,
@@ -525,25 +602,7 @@ def run_radar() -> None:
 
     while running:
         try:
-            logger.info("Polling Reddit RSS feed...")
-            posts = fetch_new_posts()
-
-            # Process posts oldest-first so alerts arrive in chronological order
-            posts_to_process = list(reversed(posts))
-
-            # Check if this is the initial run with an empty database
-            if seen_store.is_empty() and not config.ALERT_ON_FIRST_RUN_BACKLOG:
-                logger.info(
-                    "First run with empty database: silently marking %d existing posts as seen without alerts.",
-                    len(posts_to_process),
-                )
-                for post in posts_to_process:
-                    seen_store.add(post.id)
-            else:
-                for post in posts_to_process:
-                    if not running:
-                        break
-                    process(post, seen_store)
+            poll_cycle(seen_store)
 
             # Successful cycle: reset backoff to configured poll interval
             backoff = float(config.POLL_INTERVAL)
@@ -618,13 +677,17 @@ def run_radar() -> None:
     logger.info("GhostLead Radar shutdown complete.")
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     # Register signal handlers for graceful shutdown on SIGINT and SIGTERM
     signal.signal(signal.SIGINT, handle_shutdown)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, handle_shutdown)
 
-    run_radar()
+    args = parse_arguments(argv)
+    once = is_single_run_mode(args)
+
+    run_radar(once=once)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
