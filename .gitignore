@@ -1,0 +1,9 @@
+.env
+seen.db
+seen.db-journal
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
